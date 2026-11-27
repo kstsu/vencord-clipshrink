@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 
 import { MiB } from "../clipShrink.desktop/clip.ts";
-import { encodeVideo, probeVideo } from "../clipShrink.desktop/encoder.ts";
+import { encodeImage, encodeVideo, probeImage, probeVideo } from "../clipShrink.desktop/encoder.ts";
 
 const run = promisify(execFile);
 const toolDirectory = process.env.CLIPSHRINK_TEST_FFMPEG_DIR;
@@ -41,6 +41,18 @@ test("probes, keeps an in-limit original, compresses oversized video, and trims 
         assert.ok(trimmed.size <= MiB && !trimmed.original);
         assert.ok(Math.abs(result.duration - 2) < 0.1);
         assert.equal(result.hasAudio, true);
+
+        const imageSource = join(directory, "sample.png");
+        await run(ffmpeg, ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=1200x800:d=1",
+            "-vf", "format=rgba", "-frames:v", "1", "-c:v", "png", imageSource], { signal });
+        const image = await probeImage(imageSource, signal, toolDirectory);
+        assert.equal(image.width, 1200);
+        assert.equal(image.height, 800);
+        assert.equal(image.hasAlpha, true);
+        assert.ok(image.size > 16 * 1024);
+        const compressedImage = await encodeImage(imageSource, directory, image, { target: 16 * 1024, format: "png" }, signal, () => {}, toolDirectory);
+        assert.ok(compressedImage.size <= 16 * 1024);
+        assert.equal(compressedImage.original, false);
 
         await assert.rejects(() => encode(3, 7, MiB), /within the video/);
         await assert.rejects(() => encode(0, null, 100), /too long for the target/);

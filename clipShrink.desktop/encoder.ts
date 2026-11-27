@@ -4,15 +4,14 @@
  */
 
 import { execFile } from "node:child_process";
-import { stat } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 
-import { maxUploadBytes, resolveTrim } from "./clip";
+import { maxUploadBytes, resolveTrim, videoExtensions } from "./clip";
 
 const run = promisify(execFile);
 const inputOptions = ["-protocol_whitelist", "file", "-format_whitelist", "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpegts,mpeg,flv,asf,ogg"];
-export const videoExtensions = ["mp4", "mov", "m4v", "webm", "mkv", "avi", "mts", "m2ts", "mpg", "mpeg", "flv", "wmv", "ogv", "3gp"];
 const maxEncodeMs = 30 * 60_000;
 
 async function runMediaTool(tool: "ffprobe" | "ffmpeg", args: string[], signal: AbortSignal, timeout: number, directory?: string, cwd?: string) {
@@ -36,6 +35,9 @@ interface ProbeStream {
     codec_type?: string;
     codec_name?: string;
     duration?: string;
+    width?: number;
+    height?: number;
+    pix_fmt?: string;
     disposition?: { attached_pic?: number; };
 }
 
@@ -45,23 +47,129 @@ export async function probeVideo(input: string, signal: AbortSignal, toolDirecto
 
     const text = await runMediaTool("ffprobe", [
         "-v", "error", ...inputOptions, "-show_entries",
-        "stream=codec_type,codec_name,duration:stream_disposition=attached_pic:format=duration:format_tags=major_brand",
+        "stream=codec_type,codec_name,duration:stream_disposition=attached_pic:format=format_name,duration:format_tags=major_brand",
         "-of", "json", "-i", input
     ], signal, 30_000, toolDirectory);
     const { streams, format } = JSON.parse(text) as {
         streams?: ProbeStream[];
-        format?: { duration?: string; tags?: { major_brand?: string; }; };
+        format?: { duration?: string; format_name?: string; tags?: { major_brand?: string; }; };
     };
     const video = streams?.find(stream => stream.codec_type === "video" && stream.disposition?.attached_pic !== 1);
     const audio = streams?.find(stream => stream.codec_type === "audio");
     const videoDuration = Number(video?.duration);
     const duration = videoDuration > 0 ? videoDuration : Number(format?.duration);
-    if (!video || !Number.isFinite(duration) || duration <= 0)
+    if (!video || video.codec_name === "gif" || format?.format_name?.split(",")[0] === "gif" || !Number.isFinite(duration) || duration <= 0)
         throw new Error("This file has no readable video with a known duration.");
 
     const canKeepOriginal = /\.mp4$/i.test(input) && !!format?.tags?.major_brand && video.codec_name === "h264"
         && (!audio || audio.codec_name === "aac");
     return { duration, size: info.size, modified: info.mtimeMs, hasAudio: !!audio, canKeepOriginal };
+}
+
+export async function probeImage(input: string, signal: AbortSignal, toolDirectory?: string) {
+    const info = await stat(input);
+    if (!info.isFile() || !info.size) throw new Error("Choose a non-empty local image file.");
+
+    const text = await runMediaTool("ffprobe", [
+        "-v", "error", "-show_entries",
+        "stream=codec_type,codec_name,width,height,pix_fmt:format=format_name",
+        "-of", "json", "-i", input
+    ], signal, 30_000, toolDirectory);
+    const { streams, format } = JSON.parse(text) as {
+        streams?: ProbeStream[];
+        format?: { format_name?: string; };
+    };
+    const image = streams?.find(stream => stream.codec_type === "video" && stream.disposition?.attached_pic !== 1);
+    const formatName = format?.format_name?.split(",")[0]?.toLowerCase() ?? "";
+    if (!image || formatName.includes("gif") || image.codec_name === "gif")
+        throw new Error("GIFs are not supported. Choose a PNG, JPEG, WebP, or AVIF image.");
+    if (!(formatName.startsWith("png") || formatName.startsWith("jpeg") || formatName.startsWith("webp") || formatName.startsWith("avif")))
+        throw new Error("Choose a PNG, JPEG, WebP, or AVIF image.");
+
+    const width = Number(image.width);
+    const height = Number(image.height);
+    if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0)
+        throw new Error("This image has no readable dimensions.");
+
+    const pixFmt = image.pix_fmt?.toLowerCase() ?? "";
+    const hasAlpha = /(?:a|rgba|bgra|argb|abgr|yuva|gbrap)/.test(pixFmt);
+    return {
+        size: info.size,
+        modified: info.mtimeMs,
+        width,
+        height,
+        hasAlpha,
+        formatName
+    };
+}
+
+type ImageFormat = "png" | "jpeg" | "webp" | "avif";
+
+export async function encodeImage(
+    input: string, directory: string, image: Awaited<ReturnType<typeof probeImage>>,
+    request: { target: number; format: ImageFormat; }, signal: AbortSignal,
+    report: (phase: string) => void, toolDirectory?: string
+) {
+    const { target, format } = request;
+    if (!Number.isSafeInteger(target) || target <= 0 || target > maxUploadBytes) throw new Error("Invalid upload target.");
+    const source = await stat(input);
+    if (source.size !== image.size || source.mtimeMs !== image.modified)
+        throw new Error("The image changed after selection. Try attaching it again.");
+    if (source.size <= target) return { path: input, size: source.size, original: true, convertedToWebp: false };
+
+    const sourceFormat = format === "jpeg" ? "jpeg" : format;
+    const plans: Array<{ format: "png" | "jpeg" | "webp"; scale: number; quality?: number; convertedToWebp: boolean; }> = [];
+    const dimensions = [1, 0.85, 0.7, 0.55, 0.4, 0.3, 0.2];
+    const qualities = [90, 75, 60, 45];
+    const jpegQualities = [3, 8, 15, 25];
+    if (sourceFormat === "png") {
+        for (const scale of dimensions) plans.push({ format: "png", scale, convertedToWebp: false });
+        for (const scale of dimensions) for (const quality of qualities)
+            plans.push({ format: "webp", scale, quality, convertedToWebp: true });
+    } else if (sourceFormat === "webp") {
+        for (const scale of dimensions) for (const quality of qualities)
+            plans.push({ format: "webp", scale, quality, convertedToWebp: false });
+    } else if (sourceFormat === "jpeg") {
+        for (const scale of dimensions) for (const quality of jpegQualities)
+            plans.push({ format: "jpeg", scale, quality, convertedToWebp: false });
+        for (const scale of dimensions) for (const quality of qualities)
+            plans.push({ format: "webp", scale, quality, convertedToWebp: true });
+    } else {
+        for (const scale of dimensions) for (const quality of qualities)
+            plans.push({ format: "webp", scale, quality, convertedToWebp: true });
+    }
+
+    const output = join(directory, "clip-image");
+    for (let attempt = 0; attempt < plans.length; attempt++) {
+        const plan = plans[attempt];
+        if (!plan) break;
+        const extension = plan.format === "jpeg" ? "jpg" : plan.format;
+        const outputPath = `${output}.${extension}`;
+        await rm(outputPath, { force: true });
+        const maxDimension = Math.max(2, Math.floor(Math.max(image.width, image.height) * plan.scale));
+        const filter = `scale=w='min(iw,${maxDimension})':h='min(ih,${maxDimension})':force_original_aspect_ratio=decrease:force_divisible_by=2`;
+        const args = [
+            "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-autorotate",
+            "-i", input, "-frames:v", "1", "-vf", filter, "-an", "-sn", "-dn", "-map_metadata", "-1"
+        ];
+        if (plan.format === "png") {
+            args.push("-c:v", "png", "-compression_level", "9");
+        } else if (plan.format === "jpeg") {
+            args.push("-c:v", "mjpeg", "-q:v", `${plan.quality ?? 75}`);
+        } else {
+            args.push("-c:v", "libwebp", "-lossless", "0", "-q:v", `${plan.quality ?? 75}`);
+            if (image.hasAlpha) args.push("-pix_fmt", "yuva420p");
+        }
+        args.push(outputPath);
+
+        report(`Sizing image (attempt ${attempt + 1} of ${plans.length})…`);
+        await runMediaTool("ffmpeg", args, signal, maxEncodeMs, toolDirectory, directory);
+        const result = await stat(outputPath);
+        if (result.size <= target)
+            return { path: outputPath, size: result.size, original: false, convertedToWebp: plan.convertedToWebp };
+    }
+
+    throw new Error("ClipShrink couldn't fit this image under the size cap. Try a lower-resolution source image.");
 }
 
 export async function encodeVideo(

@@ -6,6 +6,8 @@
 export const MiB = 1024 ** 2;
 export const maxUploadBytes = 1024 * MiB;
 export const chunkBytes = 8 * MiB;
+export const imageExtensions = ["png", "jpg", "jpeg", "jfif", "webp", "avif"];
+export const videoExtensions = ["mp4", "mov", "m4v", "webm", "mkv", "avi", "mts", "m2ts", "mpg", "mpeg", "flv", "wmv", "ogv", "3gp"];
 
 function parseTimestamp(timestamp: string): number {
     const parts = timestamp.trim().split(":");
@@ -54,4 +56,14 @@ export function targetSize(limit: number, manualLimitMiB: number) {
     const cap = manualLimitMiB === 0 ? limit : Math.min(limit, Math.floor(manualLimitMiB * MiB));
     if (cap < MiB) throw new Error("Set the optional size cap to at least 1 MiB, or use 0 for automatic.");
     return Math.floor(cap * 0.98);
+}
+
+export function isImageName(name: string) {
+    const extension = name.match(/\.([^.]+)$/)?.[1]?.toLowerCase();
+    return extension != null && imageExtensions.includes(extension);
+}
+
+export function isVideoName(name: string, extensions: readonly string[]) {
+    const extension = name.match(/\.([^.]+)$/)?.[1]?.toLowerCase();
+    return extension != null && extensions.includes(extension);
 }

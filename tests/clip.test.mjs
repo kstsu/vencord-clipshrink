@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { estimateUploadLimit, MiB, parseRange, targetSize } from "../clipShrink.desktop/clip.ts";
+import { estimateUploadLimit, isImageName, isVideoName, MiB, parseRange, targetSize, videoExtensions } from "../clipShrink.desktop/clip.ts";
 
 test("parses hours, minutes, fractional seconds, and open-ended ranges", () => {
     assert.deepEqual(parseRange("00:15:13 - 00:17:22", 1200), { start: 913, end: 1042, duration: 129 });
@@ -31,4 +31,13 @@ test("reserves size headroom and never raises the automatic limit", () => {
     assert.equal(targetSize(20 * MiB, 50), targetSize(20 * MiB, 0));
     assert.equal(targetSize(50 * MiB, 10), Math.floor(9.8 * MiB));
     for (const cap of [0.5, -1, 1025, NaN, Infinity]) assert.throws(() => targetSize(20 * MiB, cap));
+});
+
+test("classifies supported still images and videos without accepting GIFs", () => {
+    assert.equal(isImageName("photo.PNG"), true);
+    assert.equal(isImageName("photo.gif"), false);
+    assert.equal(isImageName("photo.png.exe"), false);
+    assert.equal(isVideoName("clip.MP4", videoExtensions), true);
+    assert.equal(isVideoName("clip.gif", videoExtensions), false);
+    assert.equal(isVideoName("clip.mp4.exe", videoExtensions), false);
 });

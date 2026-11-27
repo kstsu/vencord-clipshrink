@@ -1,6 +1,6 @@
 # ClipShrink
 
-ClipShrink is a desktop Vencord userplugin that trims videos and compresses them to fit Discord's estimated upload limit. Processing happens on your computer with FFmpeg. The result goes into your Discord draft; ClipShrink does not send the message for you or modify the original file.
+ClipShrink is a desktop Vencord userplugin that automatically compresses supported local videos and still images before Discord uploads them. It also has a scissors button for selecting and optionally trimming a video manually. Processing happens on your computer with FFmpeg. ClipShrink does not send the message for you or modify the original file.
 
 ## Install
 
@@ -12,18 +12,26 @@ The prebuilt Vencord installer alone cannot install this userplugin. The browser
 
 ## Use
 
+### Automatic uploads
+
+With **Automatic compression** enabled, ClipShrink watches Discord's normal attachment flow and the capture-phase paste event. Videos and still images that exceed the target are processed locally before they are placed in the draft. This covers the normal picker, drag-and-drop, and pasted files. The default automatic limits are 512 MiB per input, 10 minutes per video, 14 minutes per encode, and one encode at a time; all are configurable in ClipShrink settings.
+
+ClipShrink leaves GIFs and unsupported files alone. If FFmpeg is unavailable or a supported file cannot be processed within the configured limits, that file is not added to the draft rather than silently uploading the original. The error is shown as a toast; retry after fixing FFmpeg/settings or use the normal upload deliberately.
+
+### Manual scissors flow
+
 1. Click the **ClipShrink** scissors button in the chat composer and select a video.
 2. Enter an optional trim range using `HH:MM:SS`, `MM:SS`, or seconds. For example, `00:15:13 - 00:17:22` keeps 2 minutes and 9 seconds; `15.5 - 18` keeps 2.5 seconds. Leave it blank to keep the whole video, or use `15 -` to keep everything after 15 seconds.
 3. Click **Prepare attachment**. When it appears in your draft, add any message text and send as usual.
 
 ClipShrink uses Discord's live account limit when available, considers known boosted-server upload perks, and leaves 2% headroom. Its fallback account limits are 20 MiB for Free, 50 MiB for Nitro Basic, and up to 1 GiB for full Nitro. Discord may apply other limits or experiments; if Discord rejects a file, set a lower **size cap** in ClipShrink settings and retry. The cap cannot increase the estimate.
 
-An untrimmed H.264/AAC MP4 that already fits is attached without re-encoding. Other results use H.264 MP4 with AAC audio when present. Large outputs can use significant memory when loaded into the Discord composer; set a lower cap or select a shorter range if needed. Normal Discord uploads, paste, and drag-and-drop are not intercepted.
+An untrimmed H.264/AAC MP4 that already fits is attached without re-encoding. Other video results use H.264 MP4 with AAC audio when present. Images keep their format where possible and are progressively reduced without upscaling. PNG transparency is preserved; when a conversion is needed for an image with alpha, ClipShrink uses WebP and tells you. Large outputs can use significant memory when loaded into the Discord composer; set a lower cap or select a shorter range if needed.
 
 ## Development checks
 
 - Run `pnpm test:ts` and `pnpm build --dev` from the Vencord checkout after copying the userplugin.
 - Run `node --test tests/clip.test.mjs` from this repository to test the range and limit logic (Node 22.18+).
-- Run `pnpm dlx tsx --test tests/*.test.mjs` to include the real FFmpeg integration test. Put the tools on PATH or set `CLIPSHRINK_TEST_FFMPEG_DIR` to their directory. The integration test generates its own media and cleans it up.
+- Run `pnpm dlx tsx --test tests/*.test.mjs` to include the real FFmpeg integration test. Put the tools on PATH or set `CLIPSHRINK_TEST_FFMPEG_DIR` to their directory. The integration test generates its own video and PNG image and cleans them up.
 
 Licensed under GPL-3.0-or-later.

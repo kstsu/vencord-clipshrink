@@ -8,8 +8,8 @@ import { mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join } from "node:path";
 
-import { chunkBytes } from "./clip";
-import { encodeVideo, probeVideo, videoExtensions } from "./encoder";
+import { chunkBytes, videoExtensions } from "./clip";
+import { encodeImage, encodeVideo, probeImage, probeVideo } from "./encoder";
 
 type Selection = Awaited<ReturnType<typeof probeVideo>>;
 type Encoded = Awaited<ReturnType<typeof encodeVideo>>;
@@ -29,6 +29,11 @@ interface Session {
 
 const sessions = new Map<number, Session>();
 let choosingFFmpeg = false;
+const defaultAutomaticInputLimit = 512 * 1024 ** 2;
+const defaultAutomaticDurationLimit = 10 * 60;
+const defaultAutomaticEncodeLimit = 14 * 60;
+const defaultAutomaticConcurrency = 1;
+let activeAutomaticEncodes = 0;
 
 const configPath = () => join(app.getPath("userData"), "clipshrink-ffmpeg-dir.txt");
 
@@ -203,5 +208,98 @@ export async function readChunk(event: IpcMainInvokeEvent, offset: number) {
         return await task;
     } finally {
         if (session.task === task) session.task = undefined;
+    }
+}
+
+function inputExtension(name: string) {
+    const extension = extname(name).slice(1).toLowerCase();
+    if (videoExtensions.includes(extension)) return extension;
+    if (["png", "jpg", "jpeg", "jfif", "webp", "avif"].includes(extension)) return extension;
+    return null;
+}
+
+function automaticOutputName(name: string, extension: string) {
+    const stem = basename(name).replace(/\.[^.]+$/, "") || "file";
+    return `${Array.from(stem).slice(0, 85).join("")}-clip.${extension}`;
+}
+
+export async function processFile(
+    event: IpcMainInvokeEvent, name: string, data: ArrayBuffer, target: number,
+    limits?: {
+        maxInputBytes?: number;
+        maxDurationSeconds?: number;
+        maxEncodeSeconds?: number;
+        maxConcurrentEncodes?: number;
+    }
+) {
+    if (typeof name !== "string" || name.length === 0 || name.length > 255)
+        throw new Error("The selected file has an invalid name.");
+    const maxInputBytesSetting = limits?.maxInputBytes;
+    const maxDurationSecondsSetting = limits?.maxDurationSeconds;
+    const maxEncodeSecondsSetting = limits?.maxEncodeSeconds;
+    const maxConcurrentEncodesSetting = limits?.maxConcurrentEncodes;
+    const maxInputBytes = Number.isSafeInteger(maxInputBytesSetting) && maxInputBytesSetting !== undefined && maxInputBytesSetting > 0
+        ? maxInputBytesSetting
+        : defaultAutomaticInputLimit;
+    const maxDurationSeconds = Number.isSafeInteger(maxDurationSecondsSetting) && maxDurationSecondsSetting !== undefined && maxDurationSecondsSetting > 0
+        ? maxDurationSecondsSetting
+        : defaultAutomaticDurationLimit;
+    const maxEncodeSeconds = Number.isSafeInteger(maxEncodeSecondsSetting) && maxEncodeSecondsSetting !== undefined && maxEncodeSecondsSetting > 0
+        ? Math.min(maxEncodeSecondsSetting, 30 * 60)
+        : defaultAutomaticEncodeLimit;
+    const maxConcurrentEncodes = Number.isSafeInteger(maxConcurrentEncodesSetting) && maxConcurrentEncodesSetting !== undefined && maxConcurrentEncodesSetting > 0
+        ? Math.min(maxConcurrentEncodesSetting, 4)
+        : defaultAutomaticConcurrency;
+    if (!(data instanceof ArrayBuffer) || data.byteLength === 0 || data.byteLength > maxInputBytes)
+        throw new Error("This file is too large for automatic ClipShrink processing.");
+    if (!Number.isSafeInteger(target) || target <= 0) throw new Error("Invalid upload target.");
+    if (data.byteLength <= target) return { kind: "unchanged" as const };
+
+    const extension = inputExtension(name);
+    if (!extension) return { kind: "unchanged" as const };
+    if (activeAutomaticEncodes >= maxConcurrentEncodes)
+        throw new Error("ClipShrink is already processing another automatic upload. Try again in a moment.");
+
+    activeAutomaticEncodes++;
+    let directory: string | undefined;
+    const controller = new AbortController();
+    try {
+        directory = await mkdtemp(join(tmpdir(), "clipshrink-auto-"));
+        const input = join(directory, `input.${extension}`);
+        await writeFile(input, new Uint8Array(data));
+        const toolDirectory = await getFFmpegDirectory(event) ?? undefined;
+        const processingSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(maxEncodeSeconds * 1000)]);
+        if (videoExtensions.includes(extension)) {
+            const video = await probeVideo(input, processingSignal, toolDirectory);
+            if (video.duration > maxDurationSeconds) throw new Error("This video is too long for automatic ClipShrink processing.");
+            const result = await encodeVideo(input, directory, video, { start: 0, end: null, target }, processingSignal, () => {}, toolDirectory);
+            if (result.original) return { kind: "unchanged" as const };
+            const output = await readFile(result.path);
+            return {
+                kind: "processed" as const,
+                data: output.buffer.slice(output.byteOffset, output.byteOffset + output.byteLength),
+                name: automaticOutputName(name, "mp4"),
+                type: "video/mp4",
+                convertedToWebp: false
+            };
+        }
+
+        const image = await probeImage(input, processingSignal, toolDirectory);
+        const format = extension === "jpg" || extension === "jpeg" || extension === "jfif" ? "jpeg"
+            : extension === "png" ? "png" : extension === "webp" ? "webp" : "avif";
+        const result = await encodeImage(input, directory, image, { target, format }, processingSignal, () => {}, toolDirectory);
+        if (result.original) return { kind: "unchanged" as const };
+        const output = await readFile(result.path);
+        const outputExtension = result.convertedToWebp ? "webp" : ["jpeg", "jfif"].includes(extension) ? "jpg" : extension;
+        return {
+            kind: "processed" as const,
+            data: output.buffer.slice(output.byteOffset, output.byteOffset + output.byteLength),
+            name: automaticOutputName(name, outputExtension),
+            type: outputExtension === "jpg" ? "image/jpeg" : `image/${outputExtension}`,
+            convertedToWebp: result.convertedToWebp
+        };
+    } finally {
+        activeAutomaticEncodes--;
+        if (directory) await rm(directory, { recursive: true, force: true, maxRetries: 3 });
     }
 }

@@ -12,9 +12,9 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import definePlugin, { IconComponent, OptionType, PluginNative } from "@utils/types";
 import { Channel, RenderModalProps, User } from "@vencord/discord-types";
 import { findByPropsLazy } from "@webpack";
-import { ChannelStore, closeModal, DraftType, GuildStore, Modal, openModal, OverridePremiumTypeStore, PermissionsBits, PermissionStore, React, SelectedChannelStore, showToast, UploadAttachmentStore, UploadHandler, useEffect, useRef, UserStore, useState } from "@webpack/common";
+import { ChannelStore, closeModal, DraftType, FluxDispatcher, GuildStore, Modal, openModal, OverridePremiumTypeStore, PermissionsBits, PermissionStore, React, SelectedChannelStore, showToast, UploadAttachmentStore, UploadHandler, useEffect, useRef, UserStore, useState } from "@webpack/common";
 
-import { chunkBytes, estimateUploadLimit, MiB, parseRange, targetSize } from "./clip";
+import { chunkBytes, estimateUploadLimit, isImageName, isVideoName, MiB, parseRange, targetSize, videoExtensions } from "./clip";
 
 const Native = VencordNative.pluginHelpers.ClipShrink as PluginNative<typeof import("./native")> | undefined;
 const accountLimits = findByPropsLazy("getUserMaxFileSize") as { getUserMaxFileSize(user: User): number; };
@@ -23,6 +23,38 @@ const settings = definePluginSettings({
         type: OptionType.NUMBER,
         description: "Optional lower size cap in MiB. Use 0 to target Discord's estimated upload limit.",
         default: 0
+    },
+    automaticCompression: {
+        type: OptionType.BOOLEAN,
+        description: "Compress videos and still images before they are added to Discord uploads.",
+        default: true
+    },
+    automaticOnlyOverLimit: {
+        type: OptionType.BOOLEAN,
+        description: "Only process automatic uploads that exceed the estimated Discord limit.",
+        default: true
+    },
+    automaticMaxInputMiB: {
+        type: OptionType.NUMBER,
+        description: "Maximum input size for automatic processing in MiB.",
+        default: 512
+    },
+    automaticMaxDurationMinutes: {
+        type: OptionType.NUMBER,
+        description: "Maximum video duration for automatic processing in minutes.",
+        default: 10
+    },
+    automaticMaxEncodeMinutes: {
+        type: OptionType.NUMBER,
+        description: "Maximum time allowed for one automatic encode in minutes.",
+        default: 14
+    },
+    automaticMaxConcurrentEncodes: {
+        type: OptionType.NUMBER,
+        description: "Maximum number of automatic encodes at once.",
+        default: 1,
+        min: 1,
+        max: 4
     },
     ffmpegLocation: {
         type: OptionType.COMPONENT,
@@ -55,6 +87,147 @@ const formatSize = (bytes: number) => bytes < MiB ? `${Math.ceil(bytes / 1024)} 
 const errorMessage = (error: unknown) => error instanceof Error
     ? error.message.replace(/^Error invoking remote method '[^']+': Error: /, "")
     : "ClipShrink couldn't prepare the video. Try selecting it again.";
+
+type UploadAddFilesEvent = {
+    type?: unknown;
+    channelId?: unknown;
+    channel?: unknown;
+    files?: unknown;
+    uploads?: unknown;
+    items?: unknown;
+    draftType?: unknown;
+    maxFileSize?: unknown;
+    fileSizeLimit?: unknown;
+    maxFileBytes?: unknown;
+    fileSizeBytes?: unknown;
+    limits?: { fileSize?: unknown; maxFileSize?: unknown; };
+};
+
+let uploadInterceptor: ((event: unknown) => void) | undefined;
+const automaticFiles = new WeakSet<File>();
+
+function extractFiles(value: unknown): File[] {
+    if (value instanceof File) return [value];
+    if (!Array.isArray(value)) return [];
+    return value.flatMap(entry => {
+        if (entry instanceof File) return [entry];
+        if (!entry || typeof entry !== "object") return [];
+        const file = "file" in entry ? entry.file : undefined;
+        if (file instanceof File) return [file];
+        const item = "item" in entry && entry.item && typeof entry.item === "object" ? entry.item : undefined;
+        return item && "file" in item && item.file instanceof File ? [item.file] : [];
+    });
+}
+
+function numeric(value: unknown) {
+    const number = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+    return Number.isFinite(number) && number > 0 ? number : undefined;
+}
+
+function eventLimit(payload: UploadAddFilesEvent) {
+    return [
+        payload.maxFileSize, payload.fileSizeLimit, payload.maxFileBytes, payload.fileSizeBytes,
+        payload.limits?.fileSize, payload.limits?.maxFileSize
+    ].map(numeric).find(value => value !== undefined);
+}
+
+function payloadChannel(payload: UploadAddFilesEvent) {
+    if (typeof payload.channelId === "string") return ChannelStore.getChannel(payload.channelId);
+    if (payload.channel && typeof payload.channel === "object" && "id" in payload.channel && typeof payload.channel.id === "string")
+        return ChannelStore.getChannel(payload.channel.id);
+    return undefined;
+}
+
+function fileLimit(payload: UploadAddFilesEvent) {
+    const direct = eventLimit(payload);
+    if (direct) return direct;
+    const channel = payloadChannel(payload);
+    const user = UserStore.getCurrentUser();
+    return channel && user ? uploadLimit(channel, user) : estimateUploadLimit(user?.premiumType);
+}
+
+function automaticTarget(payload: UploadAddFilesEvent) {
+    const limit = fileLimit(payload);
+    try {
+        return targetSize(limit, settings.store.maxSizeMiB);
+    } catch {
+        return Math.floor(limit * 0.98);
+    }
+}
+
+function replaceUploadPayload(payload: UploadAddFilesEvent, files: File[]) {
+    payload.files = files;
+    payload.uploads = [];
+    payload.items = [];
+}
+
+function processAutomaticUploads(payload: UploadAddFilesEvent, files: File[]) {
+    if (!Native || !settings.store.automaticCompression || payload.draftType !== DraftType.ChannelMessage) return;
+    const target = automaticTarget(payload);
+    const uniqueFiles = Array.from(new Set(files));
+    const candidates = uniqueFiles.filter(file =>
+        !automaticFiles.has(file) && (isImageName(file.name) || isVideoName(file.name, videoExtensions))
+    );
+    if (!candidates.length) return;
+    if (settings.store.automaticOnlyOverLimit && candidates.every(file => file.size <= target)) return;
+
+    const channel = payloadChannel(payload);
+    if (!channel) return;
+    replaceUploadPayload(payload, []);
+    void (async () => {
+        const processed: File[] = uniqueFiles.filter(file => !candidates.includes(file));
+        for (const file of candidates) {
+            try {
+                if (file.size <= target) {
+                    automaticFiles.add(file);
+                    processed.push(file);
+                    continue;
+                }
+                const result = await Native.processFile(
+                    file.name,
+                    await file.arrayBuffer(),
+                    target,
+                    {
+                        maxInputBytes: Math.floor(Math.max(1, settings.store.automaticMaxInputMiB) * MiB),
+                        maxDurationSeconds: Math.floor(Math.max(1, settings.store.automaticMaxDurationMinutes) * 60),
+                        maxEncodeSeconds: Math.floor(Math.max(1, settings.store.automaticMaxEncodeMinutes) * 60),
+                        maxConcurrentEncodes: Math.floor(Math.max(1, settings.store.automaticMaxConcurrentEncodes))
+                    }
+                );
+                if (result.kind === "processed") {
+                    const replacement = new File([result.data], result.name, { type: result.type });
+                    automaticFiles.add(replacement);
+                    processed.push(replacement);
+                    if (result.convertedToWebp) showToast({ text: `${file.name} was converted to WebP to preserve transparency.` });
+                } else {
+                    automaticFiles.add(file);
+                    processed.push(file);
+                }
+            } catch (error) {
+                showToast({ text: `${file.name} was not added: ${errorMessage(error)}`, variant: "critical" });
+            }
+        }
+        try {
+            if (processed.length) UploadHandler.promptToUpload(processed, channel, DraftType.ChannelMessage);
+        } catch (error) {
+            showToast({ text: `ClipShrink couldn't restore the upload draft: ${errorMessage(error)}`, variant: "critical" });
+        }
+    })();
+}
+
+function handlePaste(event: ClipboardEvent) {
+    const files = Array.from(event.clipboardData?.files ?? []);
+    if (!files.length || !settings.store.automaticCompression || !Native) return;
+    const channel = ChannelStore.getChannel(SelectedChannelStore.getChannelId());
+    if (!channel) return;
+    const payload: UploadAddFilesEvent = { channelId: channel.id, draftType: DraftType.ChannelMessage };
+    const limit = automaticTarget(payload);
+    const supported = files.filter(file => isImageName(file.name) || isVideoName(file.name, videoExtensions));
+    if (!supported.length || (settings.store.automaticOnlyOverLimit && supported.every(file => file.size <= limit))) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    processAutomaticUploads(payload, files);
+}
 
 function FFmpegLocation() {
     const [directory, setDirectory] = useState<string | null>(null);
@@ -297,7 +470,26 @@ export default definePlugin({
             return <ChatBarButton tooltip="ClipShrink: trim or compress a video" onClick={() => void openClipShrink(channel)}><ClipIcon /></ChatBarButton>;
         }
     },
+    start() {
+        if (!Native) return;
+        uploadInterceptor = event => {
+            if (!event || typeof event !== "object") return;
+            const payload = event as UploadAddFilesEvent;
+            if (payload.type !== "UPLOAD_ATTACHMENT_ADD_FILES") return;
+            const files = [extractFiles(payload.files), extractFiles(payload.uploads), extractFiles(payload.items)].flat();
+            if (files.length) processAutomaticUploads(payload, files);
+        };
+        FluxDispatcher.addInterceptor(uploadInterceptor);
+        document.addEventListener("paste", handlePaste, true);
+    },
     stop() {
+        if (uploadInterceptor) {
+            const interceptors = FluxDispatcher._interceptors;
+            const index = interceptors.indexOf(uploadInterceptor);
+            if (index !== -1) interceptors.splice(index, 1);
+            uploadInterceptor = undefined;
+        }
+        document.removeEventListener("paste", handlePaste, true);
         const flow = activeFlow;
         if (!flow) return;
         void endFlow(flow);
